@@ -5,6 +5,7 @@
 #include <meta>
 #include <minwindef.h>
 #include <ranges>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -68,6 +69,39 @@ inline auto patch_out_module(
     std::string_view module_name,
     const std::unordered_map<std::string_view, void *> &iat_entries) -> std::expected<void, std::string>
 {
+    static auto excluded = std::set<std::string>{"aclayers.dll"};
+
+    auto name = std::string(MAX_PATH, '\0');
+
+    if (const auto length =
+            ::GetModuleBaseNameA(::GetCurrentProcess(), module, std::ranges::data(name), std::ranges::size(name));
+        length > 0)
+    {
+        name.resize(length);
+
+        const auto name_len = std::ranges::size(name);
+
+        for (const auto &ex : excluded)
+        {
+            const auto ex_len = std::ranges::size(ex);
+            log("comp: {} {} {} {} {}",
+                name,
+                name_len,
+                ex,
+                ex_len,
+                ::StrCmpNICA(std::ranges::data(ex), std::ranges::data(name), name_len));
+
+            if (ex_len == name_len)
+            {
+                if (::StrCmpNICA(std::ranges::data(ex), std::ranges::data(name), name_len) == 0)
+                {
+                    log("skipping: {}", name);
+                    return {};
+                }
+            }
+        }
+    }
+
     auto *base = reinterpret_cast<std::uint8_t *>(module);
 
     auto *dos_header = reinterpret_cast<::IMAGE_DOS_HEADER *>(base);
@@ -164,6 +198,8 @@ inline auto patch_out_module(
         }
     }
 
+    log("module patch done");
+
     return {};
 }
 
@@ -183,6 +219,7 @@ inline auto load_system_dll(std::string_view module_name) -> ::HMODULE
 
 inline auto iat_patcher(std::string_view module_name, const std::unordered_map<std::string_view, void *> &iat_entries)
 {
+
     const auto modules = impl::loaded_modules();
     for (const auto &[module, name] : modules)
     {
