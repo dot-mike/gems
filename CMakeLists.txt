@@ -20,7 +20,10 @@ set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
 set(CPACK_GENERATOR "ZIP")
 set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)
 set(CPACK_COMPONENTS_GROUPING IGNORE)
-set(CPACK_COMPONENTS_ALL odyssey_the_search_for_ulyssess)
+set(CPACK_COMPONENTS_ALL
+  odyssey_the_search_for_ulyssess
+  out_of_the_park_baseball_65
+)
 set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
 set(CPACK_SOURCE_IGNORE_FILES "build")
 include(CPack)
