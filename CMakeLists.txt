@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.22)
 
 project(
   gems
-  VERSION "2026.9.29.0"
+  VERSION "2026.10.18.0"
   DESCRIPTION "collection of game fixes"
   LANGUAGES C CXX
 )
