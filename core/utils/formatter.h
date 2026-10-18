@@ -8,6 +8,11 @@
 #include <string_view>
 #include <unordered_map>
 
+#pragma push_macro("WINSOCK_API_LINKAGE")
+#undef WINSOCK_API_LINKAGE
+#define WINSOCK_API_LINKAGE
+#include <winsock.h>
+#pragma pop_macro("WINSOCK_API_LINKAGE")
 #include <windows.h>
 
 #include <d3d.h>
@@ -125,6 +130,135 @@ struct std::formatter<::HWND>
     auto format(const ::HWND &obj, std::format_context &ctx) const
     {
         return std::format_to(ctx.out(), "{}", reinterpret_cast<void *>(obj));
+    }
+};
+
+template <>
+struct std::formatter<::in_addr>
+{
+    constexpr auto parse(std::format_parse_context &ctx)
+    {
+        return ctx.begin();
+    }
+
+    auto format(const ::in_addr &obj, std::format_context &ctx) const
+    {
+        const auto *bytes = reinterpret_cast<const unsigned char *>(&obj.s_addr);
+        return std::format_to(ctx.out(), "{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3]);
+    }
+};
+
+template <>
+struct std::formatter<::sockaddr>
+{
+    constexpr auto parse(std::format_parse_context &ctx)
+    {
+        return ctx.begin();
+    }
+
+    auto format(const ::sockaddr &obj, std::format_context &ctx) const
+    {
+        const auto *bytes = reinterpret_cast<const unsigned char *>(obj.sa_data);
+        if (obj.sa_family == AF_INET)
+        {
+            const auto port = (static_cast<unsigned int>(bytes[0]) << 8) | bytes[1];
+            return std::format_to(
+                ctx.out(),
+                "sockaddr{{family=AF_INET address={}.{}.{}.{} port={}}}",
+                bytes[2],
+                bytes[3],
+                bytes[4],
+                bytes[5],
+                port);
+        }
+
+        auto data = std::string{};
+        for (const auto byte : obj.sa_data)
+        {
+            std::format_to(std::back_inserter(data), "{:02x}", static_cast<unsigned char>(byte));
+        }
+
+        return std::format_to(ctx.out(), "sockaddr{{family={} data=0x{}}}", obj.sa_family, data);
+    }
+};
+
+template <>
+struct std::formatter<::hostent>
+{
+    constexpr auto parse(std::format_parse_context &ctx)
+    {
+        return ctx.begin();
+    }
+
+    auto format(const ::hostent &obj, std::format_context &ctx) const
+    {
+        auto fields = std::format("name={} aliases=[", obj.h_name ? obj.h_name : "<null>");
+
+        if (obj.h_aliases)
+        {
+            for (auto alias = obj.h_aliases; *alias; ++alias)
+            {
+                std::format_to(std::back_inserter(fields), "{}{}", alias == obj.h_aliases ? "" : ", ", *alias);
+            }
+        }
+
+        std::format_to(std::back_inserter(fields), "] addrtype={} length={} addresses=[", obj.h_addrtype, obj.h_length);
+
+        if (obj.h_addr_list)
+        {
+            for (auto address = obj.h_addr_list; *address; ++address)
+            {
+                if (address != obj.h_addr_list)
+                {
+                    fields += ", ";
+                }
+
+                const auto bytes = reinterpret_cast<const unsigned char *>(*address);
+                if (obj.h_addrtype == AF_INET)
+                {
+                    if (obj.h_length != 4)
+                    {
+                        fields += "<invalid length>";
+                        continue;
+                    }
+
+                    std::format_to(std::back_inserter(fields), "{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3]);
+                }
+#ifdef AF_INET6
+                else if (obj.h_addrtype == AF_INET6)
+                {
+                    if (obj.h_length != 16)
+                    {
+                        fields += "<invalid length>";
+                        continue;
+                    }
+
+                    for (auto i = 0; i < 16; i += 2)
+                    {
+                        std::format_to(
+                            std::back_inserter(fields), "{}{:02x}{:02x}", i == 0 ? "" : ":", bytes[i], bytes[i + 1]);
+                    }
+                }
+#endif
+                else
+                {
+                    if (obj.h_length <= 0)
+                    {
+                        fields += "<invalid length>";
+                        continue;
+                    }
+
+                    fields += "0x";
+                    for (auto i = 0; i < obj.h_length; ++i)
+                    {
+                        std::format_to(std::back_inserter(fields), "{:02x}", bytes[i]);
+                    }
+                }
+            }
+        }
+
+        fields += "]";
+        return std::format_to(ctx.out(), "hostent{{{}}}", fields);
     }
 };
 
