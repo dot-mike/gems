@@ -28,6 +28,7 @@
 #include "core/utils/iat_patcher.h"
 #include "core/utils/log.h"
 #include "core/utils/meta.h"
+#include "core/utils/narrow.h"
 #include "core/utils/trampoline.h"
 
 using namespace std::literals;
@@ -142,49 +143,10 @@ namespace gems::impl
 auto g_kernel32 = ::HMODULE{};
 auto g_proxied_wsock32 = ::HMODULE{};
 auto g_iat_entries = std::unordered_map<std::string_view, void *>{};
+auto g_iat_ordinals = IATOrdinalNames{};
 auto g_system_dll_functions = std::unordered_map<std::string_view, void *>{};
 void *g_get_proc_address = {};
 auto g_mutex = std::mutex{};
-
-auto narrow(std::wstring_view str) -> std::string
-{
-    auto length = ::WideCharToMultiByte(
-        CP_UTF8, WC_NO_BEST_FIT_CHARS, std::ranges::data(str), std::ranges::size(str), nullptr, 0, nullptr, nullptr);
-
-    if (length == 0)
-    {
-        log("failed to get string length");
-        return {};
-    }
-
-    auto res = std::string(length, '\0');
-
-    length = ::WideCharToMultiByte(
-        CP_UTF8,
-        WC_NO_BEST_FIT_CHARS,
-        std::ranges::data(str),
-        std::ranges::size(str),
-        std::ranges::data(res),
-        std::ranges::size(res),
-        nullptr,
-        nullptr);
-
-    if (length == 0)
-    {
-        log("failed to narrow string");
-        return {};
-    }
-
-    return res;
-}
-
-typedef struct _UNICODE_STRING
-{
-    USHORT Length;
-    USHORT MaximumLength;
-    PWSTR Buffer;
-} UNICODE_STRING, *PUNICODE_STRING;
-typedef const UNICODE_STRING *PCUNICODE_STRING;
 
 typedef struct _LDR_DLL_LOADED_NOTIFICATION_DATA
 {
@@ -210,21 +172,16 @@ typedef union _LDR_DLL_NOTIFICATION_DATA
     LDR_DLL_UNLOADED_NOTIFICATION_DATA Unloaded;
 } LDR_DLL_NOTIFICATION_DATA, *PLDR_DLL_NOTIFICATION_DATA;
 
-auto narrow(const UNICODE_STRING *str) -> std::string
-{
-    return narrow(std::wstring_view{str->Buffer, str->Length / sizeof(WCHAR)});
-}
-
 ::FARPROC WINAPI GetProcAddress(::HMODULE hModule, ::LPCSTR lpProcName)
 {
     const auto real_get_proc_address = reinterpret_cast<decltype(&::GetProcAddress)>(g_get_proc_address);
-    log("real GetProcAddress: {}", (void *)real_get_proc_address);
 
     // Ordinals occupy the low word, not a readable string.
     if (reinterpret_cast<std::uintptr_t>(lpProcName) <= 0xffffu)
     {
         return real_get_proc_address(hModule, lpProcName);
     }
+    log("real GetProcAddress: {} {}", (void *)real_get_proc_address, lpProcName);
 
     ensure(g_proxied_wsock32 != ::HMODULE{}, "proxied wsock32 not set");
 
@@ -258,7 +215,7 @@ VOID CALLBACK LdrDllNotification(::ULONG NotificationReason, const LDR_DLL_NOTIF
             ensure(module != NULL, "failed to load module");
 
             {
-                const auto res = gems::impl::patch_out_module(module, "wsock32.dll", g_iat_entries);
+                const auto res = gems::impl::patch_out_module(module, "wsock32.dll", g_iat_entries, g_iat_ordinals);
                 if (!res)
                 {
                     log("failed to patch {}: {}", full_dll_name, res.error());
@@ -306,12 +263,6 @@ auto try_load_iat_hooks(std::source_location loc = std::source_location::current
         reinterpret_cast<LdrRegisterDllNotificationFn>(::GetProcAddress(ntdll, "LdrRegisterDllNotification"));
     ensure(LdrRegisterDllNotification != nullptr, "failed to find LdrRegisterDllNotification");
 
-    log("registering loader callback");
-    void *cookie = {};
-    ensure(
-        LdrRegisterDllNotification(0u, &gems::impl::LdrDllNotification, nullptr, &cookie) == 0,
-        "could not register callback");
-
     if (!g_get_proc_address)
     {
         g_kernel32 = load_system_dll("kernel32.dll");
@@ -341,6 +292,7 @@ auto try_load_iat_hooks(std::source_location loc = std::source_location::current
             continue;
         }
 
+        log("patching: {}", func_name);
         g_system_dll_functions[func_name] = addr;
 
         if constexpr (
@@ -350,7 +302,9 @@ auto try_load_iat_hooks(std::source_location loc = std::source_location::current
                 std::ranges::find(proxy_functions, func_name, [](const auto e) { return std::meta::identifier_of(e); });
 
             using ArgsTupleType = GetArgs<typename[:std::meta::type_of(func):]>::type;
-            constexpr auto trampoline = build_trampoline<ArgsTupleType>(func, *proxy_func_meta);
+            gems::original_function<&[:func:]> = reinterpret_cast<decltype(&[:func:])>(addr);
+            constexpr auto trampoline =
+                build_trampoline<ArgsTupleType>(func, *proxy_func_meta, ^^gems::original_trampoline);
 
             addr = reinterpret_cast<void *>(&[:trampoline:]);
         }
@@ -359,9 +313,11 @@ auto try_load_iat_hooks(std::source_location loc = std::source_location::current
         g_iat_entries[func_name] = addr;
     }
 
+    g_iat_ordinals = build_ordinal_iat_names(g_proxied_wsock32, g_iat_entries);
+
     log("found {} iat entries to patch", std::ranges::size(g_iat_entries));
 
-    iat_patcher("wsock32.dll", g_iat_entries);
+    iat_patcher("wsock32.dll", g_iat_entries, g_iat_ordinals);
     iat_patcher("kernel32.dll", {{"GetProcAddress", reinterpret_cast<void *>(&gems::impl::GetProcAddress)}});
 }
 }
@@ -371,15 +327,15 @@ extern "C"
 
 [[= gems::IATPatch]] int WINAPI __WSAFDIsSet(::SOCKET s, ::fd_set *set)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("__WSAFDIsSet");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("__WSAFDIsSet");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&__WSAFDIsSet)>(orig_func->second)(s, set);
@@ -387,15 +343,15 @@ extern "C"
 
 [[= gems::IATPatch]] ::SOCKET WINAPI accept(::SOCKET s, ::sockaddr *addr, int *addrlen)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("accept");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("accept");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&accept)>(orig_func->second)(s, addr, addrlen);
@@ -403,15 +359,15 @@ extern "C"
 
 [[= gems::IATPatch]] int WINAPI bind(::SOCKET s, const ::sockaddr *name, int namelen)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("bind");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("bind");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&bind)>(orig_func->second)(s, name, namelen);
@@ -419,15 +375,15 @@ extern "C"
 
 [[= gems::IATPatch]] int WINAPI closesocket(::SOCKET s)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("closesocket");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("closesocket");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&closesocket)>(orig_func->second)(s);
@@ -435,15 +391,15 @@ extern "C"
 
 [[= gems::IATPatch]] int WINAPI connect(::SOCKET s, const ::sockaddr *name, int namelen)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("connect");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("connect");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&connect)>(orig_func->second)(s, name, namelen);
@@ -451,15 +407,15 @@ extern "C"
 
 [[= gems::IATPatch]] int WINAPI ioctlsocket(::SOCKET s, long cmd, ::u_long *argp)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("ioctlsocket");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("ioctlsocket");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&ioctlsocket)>(orig_func->second)(s, cmd, argp);
@@ -467,15 +423,15 @@ extern "C"
 
 [[= gems::IATPatch]] int WINAPI getpeername(::SOCKET s, ::sockaddr *name, int *namelen)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("getpeername");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("getpeername");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&getpeername)>(orig_func->second)(s, name, namelen);
@@ -483,15 +439,15 @@ extern "C"
 
 [[= gems::IATPatch]] int WINAPI getsockname(::SOCKET s, ::sockaddr *name, int *namelen)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("getsockname");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("getsockname");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&getsockname)>(orig_func->second)(s, name, namelen);
@@ -499,15 +455,15 @@ extern "C"
 
 [[= gems::IATPatch]] int WINAPI getsockopt(::SOCKET s, int level, int optname, char *optval, int *optlen)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("getsockopt");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("getsockopt");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&getsockopt)>(orig_func->second)(s, level, optname, optval, optlen);
@@ -515,15 +471,15 @@ extern "C"
 
 [[= gems::IATPatch]] ::u_long WINAPI htonl(::u_long hostlong)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("htonl");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("htonl");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&htonl)>(orig_func->second)(hostlong);
@@ -531,15 +487,15 @@ extern "C"
 
 [[= gems::IATPatch]] ::u_short WINAPI htons(::u_short hostshort)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("htons");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("htons");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&htons)>(orig_func->second)(hostshort);
@@ -547,15 +503,15 @@ extern "C"
 
 [[= gems::IATPatch]] unsigned long WINAPI inet_addr(const char *cp)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("inet_addr");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("inet_addr");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&inet_addr)>(orig_func->second)(cp);
@@ -563,15 +519,15 @@ extern "C"
 
 [[= gems::IATPatch]] char *WINAPI inet_ntoa(::in_addr in)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("inet_ntoa");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("inet_ntoa");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&inet_ntoa)>(orig_func->second)(in);
@@ -579,15 +535,15 @@ extern "C"
 
 [[= gems::IATPatch]] int WINAPI listen(::SOCKET s, int backlog)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("listen");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("listen");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&listen)>(orig_func->second)(s, backlog);
@@ -595,15 +551,15 @@ extern "C"
 
 [[= gems::IATPatch]] ::u_long WINAPI ntohl(::u_long netlong)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("ntohl");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("ntohl");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&ntohl)>(orig_func->second)(netlong);
@@ -611,15 +567,15 @@ extern "C"
 
 [[= gems::IATPatch]] ::u_short WINAPI ntohs(::u_short netshort)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("ntohs");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("ntohs");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&ntohs)>(orig_func->second)(netshort);
@@ -627,15 +583,15 @@ extern "C"
 
 [[= gems::IATPatch]] int WINAPI recv(::SOCKET s, char *buf, int len, int flags)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("recv");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("recv");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&recv)>(orig_func->second)(s, buf, len, flags);
@@ -643,15 +599,15 @@ extern "C"
 
 [[= gems::IATPatch]] int WINAPI recvfrom(::SOCKET s, char *buf, int len, int flags, ::sockaddr *from, int *fromlen)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("recvfrom");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("recvfrom");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&recvfrom)>(orig_func->second)(s, buf, len, flags, from, fromlen);
@@ -660,15 +616,15 @@ extern "C"
 [[= gems::IATPatch]] int WINAPI
 select(int nfds, ::fd_set *readfds, ::fd_set *writefds, ::fd_set *exceptfds, const ::timeval *timeout)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("select");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("select");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&select)>(orig_func->second)(nfds, readfds, writefds, exceptfds, timeout);
@@ -676,31 +632,32 @@ select(int nfds, ::fd_set *readfds, ::fd_set *writefds, ::fd_set *exceptfds, con
 
 [[= gems::IATPatch]] int WINAPI send(::SOCKET s, const char *buf, int len, int flags)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    gems::log("this send");
 
+    auto target = decltype(&::send){};
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
-
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("send");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        const auto entry = gems::impl::g_iat_entries.find("send");
+        gems::ensure(entry != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
+        target = reinterpret_cast<decltype(target)>(entry->second);
     }
 
-    return reinterpret_cast<decltype(&send)>(orig_func->second)(s, buf, len, flags);
+    return target(s, buf, len, flags);
 }
 
 [[= gems::IATPatch]] int WINAPI sendto(::SOCKET s, const char *buf, int len, int flags, const ::sockaddr *to, int tolen)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("sendto");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("sendto");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&sendto)>(orig_func->second)(s, buf, len, flags, to, tolen);
@@ -708,15 +665,15 @@ select(int nfds, ::fd_set *readfds, ::fd_set *writefds, ::fd_set *exceptfds, con
 
 [[= gems::IATPatch]] int WINAPI setsockopt(::SOCKET s, int level, int optname, const char *optval, int optlen)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("setsockopt");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("setsockopt");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&setsockopt)>(orig_func->second)(s, level, optname, optval, optlen);
@@ -724,15 +681,15 @@ select(int nfds, ::fd_set *readfds, ::fd_set *writefds, ::fd_set *exceptfds, con
 
 [[= gems::IATPatch]] int WINAPI shutdown(::SOCKET s, int how)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("shutdown");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("shutdown");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&shutdown)>(orig_func->second)(s, how);
@@ -740,15 +697,15 @@ select(int nfds, ::fd_set *readfds, ::fd_set *writefds, ::fd_set *exceptfds, con
 
 [[= gems::IATPatch]] ::SOCKET WINAPI socket(int af, int type, int protocol)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("socket");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("socket");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&socket)>(orig_func->second)(af, type, protocol);
@@ -756,15 +713,15 @@ select(int nfds, ::fd_set *readfds, ::fd_set *writefds, ::fd_set *exceptfds, con
 
 [[= gems::IATPatch]] ::hostent *WINAPI gethostbyaddr(const char *addr, int len, int type)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("gethostbyaddr");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("gethostbyaddr");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&gethostbyaddr)>(orig_func->second)(addr, len, type);
@@ -772,15 +729,15 @@ select(int nfds, ::fd_set *readfds, ::fd_set *writefds, ::fd_set *exceptfds, con
 
 [[= gems::IATPatch]] ::hostent *WINAPI gethostbyname(const char *name)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("gethostbyname");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("gethostbyname");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&gethostbyname)>(orig_func->second)(name);
@@ -788,15 +745,15 @@ select(int nfds, ::fd_set *readfds, ::fd_set *writefds, ::fd_set *exceptfds, con
 
 [[= gems::IATPatch]] int WINAPI gethostname(char *name, int namelen)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("gethostname");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("gethostname");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&gethostname)>(orig_func->second)(name, namelen);
@@ -804,15 +761,15 @@ select(int nfds, ::fd_set *readfds, ::fd_set *writefds, ::fd_set *exceptfds, con
 
 [[= gems::IATPatch]] ::servent *WINAPI getservbyport(int port, const char *proto)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("getservbyport");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("getservbyport");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&getservbyport)>(orig_func->second)(port, proto);
@@ -820,15 +777,15 @@ select(int nfds, ::fd_set *readfds, ::fd_set *writefds, ::fd_set *exceptfds, con
 
 [[= gems::IATPatch]] ::servent *WINAPI getservbyname(const char *name, const char *proto)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("getservbyname");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("getservbyname");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&getservbyname)>(orig_func->second)(name, proto);
@@ -836,15 +793,15 @@ select(int nfds, ::fd_set *readfds, ::fd_set *writefds, ::fd_set *exceptfds, con
 
 [[= gems::IATPatch]] ::protoent *WINAPI getprotobynumber(int number)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("getprotobynumber");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("getprotobynumber");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&getprotobynumber)>(orig_func->second)(number);
@@ -852,15 +809,15 @@ select(int nfds, ::fd_set *readfds, ::fd_set *writefds, ::fd_set *exceptfds, con
 
 [[= gems::IATPatch]] ::protoent *WINAPI getprotobyname(const char *name)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("getprotobyname");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("getprotobyname");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&getprotobyname)>(orig_func->second)(name);
@@ -868,31 +825,32 @@ select(int nfds, ::fd_set *readfds, ::fd_set *writefds, ::fd_set *exceptfds, con
 
 [[= gems::IATPatch]] int WINAPI WSAStartup(::WORD wVersionRequested, ::LPWSADATA lpWSAData)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto startup_func = decltype(&::WSAStartup){};
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("WSAStartup");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        const auto entry = gems::impl::g_iat_entries.find("WSAStartup");
+        gems::ensure(entry != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
+        startup_func = reinterpret_cast<decltype(startup_func)>(entry->second);
     }
 
-    return reinterpret_cast<decltype(&WSAStartup)>(orig_func->second)(wVersionRequested, lpWSAData);
+    return startup_func(wVersionRequested, lpWSAData);
 }
 
 [[= gems::IATPatch]] int WINAPI WSACleanup()
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("WSACleanup");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("WSACleanup");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&WSACleanup)>(orig_func->second)();
@@ -900,15 +858,15 @@ select(int nfds, ::fd_set *readfds, ::fd_set *writefds, ::fd_set *exceptfds, con
 
 [[= gems::IATPatch]] void WINAPI WSASetLastError(int iError)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("WSASetLastError");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("WSASetLastError");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     reinterpret_cast<decltype(&WSASetLastError)>(orig_func->second)(iError);
@@ -916,15 +874,15 @@ select(int nfds, ::fd_set *readfds, ::fd_set *writefds, ::fd_set *exceptfds, con
 
 [[= gems::IATPatch]] int WINAPI WSAGetLastError()
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("WSAGetLastError");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("WSAGetLastError");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&WSAGetLastError)>(orig_func->second)();
@@ -932,15 +890,15 @@ select(int nfds, ::fd_set *readfds, ::fd_set *writefds, ::fd_set *exceptfds, con
 
 [[= gems::IATPatch]] ::BOOL WINAPI WSAIsBlocking()
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("WSAIsBlocking");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("WSAIsBlocking");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&WSAIsBlocking)>(orig_func->second)();
@@ -948,15 +906,15 @@ select(int nfds, ::fd_set *readfds, ::fd_set *writefds, ::fd_set *exceptfds, con
 
 [[= gems::IATPatch]] int WINAPI WSAUnhookBlockingHook()
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("WSAUnhookBlockingHook");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("WSAUnhookBlockingHook");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&WSAUnhookBlockingHook)>(orig_func->second)();
@@ -964,15 +922,15 @@ select(int nfds, ::fd_set *readfds, ::fd_set *writefds, ::fd_set *exceptfds, con
 
 [[= gems::IATPatch]] ::FARPROC WINAPI WSASetBlockingHook(::FARPROC lpBlockFunc)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("WSASetBlockingHook");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("WSASetBlockingHook");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&WSASetBlockingHook)>(orig_func->second)(lpBlockFunc);
@@ -980,15 +938,15 @@ select(int nfds, ::fd_set *readfds, ::fd_set *writefds, ::fd_set *exceptfds, con
 
 [[= gems::IATPatch]] int WINAPI WSACancelBlockingCall()
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("WSACancelBlockingCall");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("WSACancelBlockingCall");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&WSACancelBlockingCall)>(orig_func->second)();
@@ -997,15 +955,15 @@ select(int nfds, ::fd_set *readfds, ::fd_set *writefds, ::fd_set *exceptfds, con
 [[= gems::IATPatch]] ::HANDLE WINAPI
 WSAAsyncGetServByName(::HWND hWnd, ::u_int wMsg, const char *name, const char *proto, char *buf, int buflen)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("WSAAsyncGetServByName");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("WSAAsyncGetServByName");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&WSAAsyncGetServByName)>(orig_func->second)(hWnd, wMsg, name, proto, buf, buflen);
@@ -1014,15 +972,15 @@ WSAAsyncGetServByName(::HWND hWnd, ::u_int wMsg, const char *name, const char *p
 [[= gems::IATPatch]] ::HANDLE WINAPI
 WSAAsyncGetServByPort(::HWND hWnd, ::u_int wMsg, int port, const char *proto, char *buf, int buflen)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("WSAAsyncGetServByPort");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("WSAAsyncGetServByPort");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&WSAAsyncGetServByPort)>(orig_func->second)(hWnd, wMsg, port, proto, buf, buflen);
@@ -1031,15 +989,15 @@ WSAAsyncGetServByPort(::HWND hWnd, ::u_int wMsg, int port, const char *proto, ch
 [[= gems::IATPatch]] ::HANDLE WINAPI
 WSAAsyncGetProtoByName(::HWND hWnd, ::u_int wMsg, const char *name, char *buf, int buflen)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("WSAAsyncGetProtoByName");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("WSAAsyncGetProtoByName");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&WSAAsyncGetProtoByName)>(orig_func->second)(hWnd, wMsg, name, buf, buflen);
@@ -1048,15 +1006,15 @@ WSAAsyncGetProtoByName(::HWND hWnd, ::u_int wMsg, const char *name, char *buf, i
 [[= gems::IATPatch]] ::HANDLE WINAPI
 WSAAsyncGetProtoByNumber(::HWND hWnd, ::u_int wMsg, int number, char *buf, int buflen)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("WSAAsyncGetProtoByNumber");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("WSAAsyncGetProtoByNumber");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&WSAAsyncGetProtoByNumber)>(orig_func->second)(hWnd, wMsg, number, buf, buflen);
@@ -1065,15 +1023,15 @@ WSAAsyncGetProtoByNumber(::HWND hWnd, ::u_int wMsg, int number, char *buf, int b
 [[= gems::IATPatch]] ::HANDLE WINAPI
 WSAAsyncGetHostByName(::HWND hWnd, ::u_int wMsg, const char *name, char *buf, int buflen)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("WSAAsyncGetHostByName");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("WSAAsyncGetHostByName");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&WSAAsyncGetHostByName)>(orig_func->second)(hWnd, wMsg, name, buf, buflen);
@@ -1082,15 +1040,15 @@ WSAAsyncGetHostByName(::HWND hWnd, ::u_int wMsg, const char *name, char *buf, in
 [[= gems::IATPatch]] ::HANDLE WINAPI
 WSAAsyncGetHostByAddr(::HWND hWnd, ::u_int wMsg, const char *addr, int len, int type, char *buf, int buflen)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("WSAAsyncGetHostByAddr");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("WSAAsyncGetHostByAddr");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&WSAAsyncGetHostByAddr)>(
@@ -1099,15 +1057,15 @@ WSAAsyncGetHostByAddr(::HWND hWnd, ::u_int wMsg, const char *addr, int len, int 
 
 [[= gems::IATPatch]] int WINAPI WSACancelAsyncRequest(::HANDLE hAsyncTaskHandle)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("WSACancelAsyncRequest");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("WSACancelAsyncRequest");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&WSACancelAsyncRequest)>(orig_func->second)(hAsyncTaskHandle);
@@ -1115,15 +1073,15 @@ WSAAsyncGetHostByAddr(::HWND hWnd, ::u_int wMsg, const char *addr, int len, int 
 
 [[= gems::IATPatch]] int WINAPI WSAAsyncSelect(::SOCKET s, ::HWND hWnd, ::u_int wMsg, long lEvent)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("WSAAsyncSelect");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("WSAAsyncSelect");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&WSAAsyncSelect)>(orig_func->second)(s, hWnd, wMsg, lEvent);
@@ -1131,15 +1089,15 @@ WSAAsyncGetHostByAddr(::HWND hWnd, ::u_int wMsg, const char *addr, int len, int 
 
 [[= gems::IATPatch]] int WINAPI WSARecvEx(::SOCKET s, char *buf, int len, int *flags)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("WSARecvEx");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("WSARecvEx");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&WSARecvEx)>(orig_func->second)(s, buf, len, flags);
@@ -1154,15 +1112,15 @@ WSAAsyncGetHostByAddr(::HWND hWnd, ::u_int wMsg, const char *addr, int len, int 
     ::LPTRANSMIT_FILE_BUFFERS lpTransmitBuffers,
     ::DWORD dwReserved)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("TransmitFile");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("TransmitFile");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&TransmitFile)>(orig_func->second)(
@@ -1179,15 +1137,15 @@ WSAAsyncGetHostByAddr(::HWND hWnd, ::u_int wMsg, const char *addr, int len, int 
     ::LPDWORD lpdwBytesReceived,
     ::LPOVERLAPPED lpOverlapped)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("AcceptEx");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("AcceptEx");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&AcceptEx)>(orig_func->second)(
@@ -1211,15 +1169,15 @@ WSAAsyncGetHostByAddr(::HWND hWnd, ::u_int wMsg, const char *addr, int len, int 
     ::sockaddr **RemoteSockaddr,
     ::LPINT RemoteSockaddrLength)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("GetAcceptExSockaddrs");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("GetAcceptExSockaddrs");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     reinterpret_cast<decltype(&GetAcceptExSockaddrs)>(orig_func->second)(
@@ -1236,15 +1194,15 @@ WSAAsyncGetHostByAddr(::HWND hWnd, ::u_int wMsg, const char *addr, int len, int 
 [[= gems::IATPatch]] ::INT WINAPI
 EnumProtocolsA(::LPINT lpiProtocols, ::LPVOID lpProtocolBuffer, ::LPDWORD lpdwBufferLength)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("EnumProtocolsA");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("EnumProtocolsA");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&EnumProtocolsA)>(
@@ -1263,15 +1221,15 @@ EnumProtocolsA(::LPINT lpiProtocols, ::LPVOID lpProtocolBuffer, ::LPDWORD lpdwBu
     ::LPSTR lpAliasBuffer,
     ::LPDWORD lpdwAliasBufferLength)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("GetAddressByNameA");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("GetAddressByNameA");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&GetAddressByNameA)>(orig_func->second)(
@@ -1289,15 +1247,15 @@ EnumProtocolsA(::LPINT lpiProtocols, ::LPVOID lpProtocolBuffer, ::LPDWORD lpdwBu
 
 [[= gems::IATPatch]] ::INT WINAPI GetTypeByNameA(::LPSTR lpServiceName, ::LPGUID lpServiceType)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("GetTypeByNameA");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("GetTypeByNameA");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&GetTypeByNameA)>(orig_func->second)(lpServiceName, lpServiceType);
@@ -1305,15 +1263,15 @@ EnumProtocolsA(::LPINT lpiProtocols, ::LPVOID lpProtocolBuffer, ::LPDWORD lpdwBu
 
 [[= gems::IATPatch]] ::INT WINAPI GetNameByTypeA(::LPGUID lpServiceType, ::LPSTR lpServiceName, ::DWORD dwNameLength)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("GetNameByTypeA");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("GetNameByTypeA");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&GetNameByTypeA)>(orig_func->second)(lpServiceType, lpServiceName, dwNameLength);
@@ -1327,15 +1285,15 @@ EnumProtocolsA(::LPINT lpiProtocols, ::LPVOID lpProtocolBuffer, ::LPDWORD lpdwBu
     ::LPSERVICE_ASYNC_INFO lpServiceAsyncInfo,
     ::LPDWORD lpdwStatusFlags)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("SetServiceA");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("SetServiceA");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&SetServiceA)>(
@@ -1351,15 +1309,15 @@ EnumProtocolsA(::LPINT lpiProtocols, ::LPVOID lpProtocolBuffer, ::LPDWORD lpdwBu
     ::LPDWORD lpdwBufferSize,
     ::LPSERVICE_ASYNC_INFO lpServiceAsyncInfo)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("GetServiceA");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("GetServiceA");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&GetServiceA)>(orig_func->second)(
@@ -1369,15 +1327,15 @@ EnumProtocolsA(::LPINT lpiProtocols, ::LPVOID lpProtocolBuffer, ::LPDWORD lpdwBu
 [[= gems::IATPatch]] ::INT WINAPI
 EnumProtocolsW(::LPINT lpiProtocols, ::LPVOID lpProtocolBuffer, ::LPDWORD lpdwBufferLength)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("EnumProtocolsW");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("EnumProtocolsW");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&EnumProtocolsW)>(
@@ -1396,15 +1354,15 @@ EnumProtocolsW(::LPINT lpiProtocols, ::LPVOID lpProtocolBuffer, ::LPDWORD lpdwBu
     ::LPWSTR lpAliasBuffer,
     ::LPDWORD lpdwAliasBufferLength)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("GetAddressByNameW");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("GetAddressByNameW");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&GetAddressByNameW)>(orig_func->second)(
@@ -1422,15 +1380,15 @@ EnumProtocolsW(::LPINT lpiProtocols, ::LPVOID lpProtocolBuffer, ::LPDWORD lpdwBu
 
 [[= gems::IATPatch]] ::INT WINAPI GetTypeByNameW(::LPWSTR lpServiceName, ::LPGUID lpServiceType)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("GetTypeByNameW");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("GetTypeByNameW");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&GetTypeByNameW)>(orig_func->second)(lpServiceName, lpServiceType);
@@ -1438,15 +1396,15 @@ EnumProtocolsW(::LPINT lpiProtocols, ::LPVOID lpProtocolBuffer, ::LPDWORD lpdwBu
 
 [[= gems::IATPatch]] ::INT WINAPI GetNameByTypeW(::LPGUID lpServiceType, ::LPWSTR lpServiceName, ::DWORD dwNameLength)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("GetNameByTypeW");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("GetNameByTypeW");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&GetNameByTypeW)>(orig_func->second)(lpServiceType, lpServiceName, dwNameLength);
@@ -1460,15 +1418,15 @@ EnumProtocolsW(::LPINT lpiProtocols, ::LPVOID lpProtocolBuffer, ::LPDWORD lpdwBu
     ::LPSERVICE_ASYNC_INFO lpServiceAsyncInfo,
     ::LPDWORD lpdwStatusFlags)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("SetServiceW");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("SetServiceW");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&SetServiceW)>(
@@ -1484,15 +1442,15 @@ EnumProtocolsW(::LPINT lpiProtocols, ::LPVOID lpProtocolBuffer, ::LPDWORD lpdwBu
     ::LPDWORD lpdwBufferSize,
     ::LPSERVICE_ASYNC_INFO lpServiceAsyncInfo)
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("GetServiceW");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("GetServiceW");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&GetServiceW)>(orig_func->second)(
@@ -1501,15 +1459,15 @@ EnumProtocolsW(::LPINT lpiProtocols, ::LPVOID lpProtocolBuffer, ::LPDWORD lpdwBu
 
 [[= gems::IATPatch]] int WINAPI WEP()
 {
-    auto orig_func = std::ranges::cend(gems::impl::g_system_dll_functions);
+    auto orig_func = std::ranges::cend(gems::impl::g_iat_entries);
 
     {
         auto lock = std::scoped_lock(gems::impl::g_mutex);
 
         gems::impl::try_load_iat_hooks();
 
-        orig_func = gems::impl::g_system_dll_functions.find("WEP");
-        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_system_dll_functions), "could not find iat entry");
+        orig_func = gems::impl::g_iat_entries.find("WEP");
+        gems::ensure(orig_func != std::ranges::cend(gems::impl::g_iat_entries), "could not find iat entry");
     }
 
     return reinterpret_cast<decltype(&WEP)>(orig_func->second)();
