@@ -15,6 +15,7 @@
 #include "core/utils/iat_patcher.h"
 #include "core/utils/log.h"
 #include "core/utils/meta.h"
+#include "core/utils/narrow.h"
 #include "core/utils/trampoline.h"
 
 using namespace std::literals;
@@ -55,46 +56,6 @@ auto g_iat_entries = std::unordered_map<std::string_view, void *>{};
 auto g_system_dll_functions = std::unordered_map<std::string_view, void *>{};
 void *g_get_proc_address = {};
 
-auto narrow(std::wstring_view str) -> std::string
-{
-    auto length = ::WideCharToMultiByte(
-        CP_UTF8, WC_NO_BEST_FIT_CHARS, std::ranges::data(str), std::ranges::size(str), nullptr, 0, nullptr, nullptr);
-
-    if (length == 0)
-    {
-        log("failed to get string length");
-        return {};
-    }
-
-    auto res = std::string(length, '\0');
-
-    length = ::WideCharToMultiByte(
-        CP_UTF8,
-        WC_NO_BEST_FIT_CHARS,
-        std::ranges::data(str),
-        std::ranges::size(str),
-        std::ranges::data(res),
-        std::ranges::size(res),
-        nullptr,
-        nullptr);
-
-    if (length == 0)
-    {
-        log("failed to narrow string");
-        return {};
-    }
-
-    return res;
-}
-
-typedef struct _UNICODE_STRING
-{
-    USHORT Length;
-    USHORT MaximumLength;
-    PWSTR Buffer;
-} UNICODE_STRING, *PUNICODE_STRING;
-typedef const UNICODE_STRING *PCUNICODE_STRING;
-
 typedef struct _LDR_DLL_LOADED_NOTIFICATION_DATA
 {
     ULONG Flags;                  // Reserved.
@@ -118,11 +79,6 @@ typedef union _LDR_DLL_NOTIFICATION_DATA
     LDR_DLL_LOADED_NOTIFICATION_DATA Loaded;
     LDR_DLL_UNLOADED_NOTIFICATION_DATA Unloaded;
 } LDR_DLL_NOTIFICATION_DATA, *PLDR_DLL_NOTIFICATION_DATA;
-
-auto narrow(const UNICODE_STRING *str) -> std::string
-{
-    return narrow(std::wstring_view{str->Buffer, str->Length / sizeof(WCHAR)});
-}
 
 ::FARPROC WINAPI GetProcAddress(::HMODULE hModule, ::LPCSTR lpProcName)
 {
