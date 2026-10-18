@@ -23,6 +23,7 @@ set(CPACK_COMPONENTS_GROUPING IGNORE)
 set(CPACK_COMPONENTS_ALL
   odyssey_the_search_for_ulyssess
   out_of_the_park_baseball_65
+  out_of_the_park_baseball_6
 )
 set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
 set(CPACK_SOURCE_IGNORE_FILES "build")
